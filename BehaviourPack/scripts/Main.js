@@ -32,7 +32,7 @@ system.run(() => {
   dimensions = [overworld, nether, end];
 });
 
-const version_code = "0.7.19B";
+const version_code = "0.8.2F";
 const version_text = `欢迎使用无名氏服务器框架\n插件版本:${version_code}\n作者：EarthDLL(USFrameTeam)，感谢所有社区贡献者的贡献\n快速适配版本，如有Bug，及时反馈`;
 
 //命名空间
@@ -5653,6 +5653,11 @@ system_ids.works = system.runInterval(() => {
           }
         }
         var str
+		if(chest !== "" && un(world.structureManager.get(chest))){
+			array_clear(chests,chest);
+			chest = "";
+			save_data("chests", to_json(chests))
+		}
         if (chest === "") {
           var id = "usf:" + String(Date.now())
           var block = overworld.getBlock({

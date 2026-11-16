@@ -1,91 +1,176 @@
-//++++++++++++传送动画(1.20.10~1.20.60)+++++++++++++++++
-//已经通过接口适配1.21+
+// ============================================================
+//  传送动画模块（兼容 1.20.10 ~ 1.21+）
+//  支持可打断的倒计时 + 三段式摄像机动画
+//  更新打断系统
+// ============================================================
+
 import { world, system } from "@minecraft/server";
 import { config } from "./Main.js";
 
-// 维度工具
-function get_di_by_id(id) {
-    switch (id) {
-        case "minecraft:nether":
-            return world.getDimension("minecraft:nether");
-        case "minecraft:the_end":
-            return world.getDimension("minecraft:the_end");
-        case "minecraft:overworld":
-            return world.getDimension("minecraft:overworld");
-    }
-}
-
-// 动画
 const CAM = { rise: 2, move: 3, fall: 1 };
+const MSG = {
+    cancel: "§e×§c传送已被打断§e×",
+    loading: "§a→§f传送加载中，请不要移动... ",
+    executing: "§a→§f传送系统执行中§a←",
+    moving: "§a→§f开始移动至坐标点§a←",
+    falling: "§a→§f开始降落§a←",
+    done: "§a√§f动画传送完成§a√",
+};
+const COUNTDOWN_SEC = 2;
+const MOVE_THRESHOLD = 0.01;
 
-// 新增：简单传送函数（无动画）
-function simpleTeleport(player, targetLocation, targetDimension, onDone) {
-    player.teleport(targetLocation, { dimension: targetDimension });
-    if (onDone) onDone();
+function isAnimationEnabled() {
+    return config?.tp?.animation ?? true;   // 默认开启
 }
-// 修改：根据配置决定使用哪种传送方式
-export function tpWithAnimation(player, loc, dim, onDone = () => {}) {
-    // 检查动画开关配置
-    if (config?.tp?.animation === true) {
-        performTeleportAnimation(player, loc, dim).then(onDone).catch(() => {});
-    } else {
-        simpleTeleport(player, loc, dim, onDone);
+
+//  维度工具
+function getDimensionById(id) {
+    switch (id) {
+        case "minecraft:nether":   return world.getDimension("minecraft:nether");
+        case "minecraft:the_end":  return world.getDimension("minecraft:the_end");
+        default:                   return world.getDimension("minecraft:overworld");
     }
 }
 
-// 等待
+// 简单传送（无动画）
+function simpleTeleport(player, location, dimension, onDone) {
+    try {
+        player.teleport(location, { dimension });
+        if (typeof onDone === "function") onDone(true);
+    } catch (e) {
+        console.warn("简单传送失败:", e);
+        if (typeof onDone === "function") onDone(false);
+    }
+}
+export function tpWithAnimation(player, location, dimension, onDone) {
+    const callback = typeof onDone === "function" ? onDone : () => {};
+    if (!player || !player.isValid) {
+        callback(false);
+        return;
+    }
+    if (isAnimationEnabled()) {
+        performTeleportAnimation(player, location, dimension)
+            .then(() => callback(true))
+            .catch(() => callback(false));
+    } else {
+        simpleTeleport(player, location, dimension, callback);
+    }
+}
+
+// ---------- 倒计时 + 打断检测 ----------
 export function performTeleportAnimation(player, targetLocation, targetDimension) {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
+        if (!player.isValid) {
+            reject(new Error("Player invalid"));
+            return;
+        }
+
         let tick = 0;
-        const totalTicks = 2 * 20;          // 2 秒倒计时
-        const interval = system.runInterval(() => {
+        const totalTicks = COUNTDOWN_SEC * 20;
+        let prevLoc = { x: player.location.x, z: player.location.z };
+
+        const intervalId = system.runInterval(() => {
+            if (!player.isValid) {
+                system.clearRun(intervalId);
+                reject(new Error("Player left"));
+                return;
+            }
+
+            const dx = Math.abs(player.location.x - prevLoc.x);
+            const dz = Math.abs(player.location.z - prevLoc.z);
+            if (dx > MOVE_THRESHOLD || dz > MOVE_THRESHOLD) {
+                system.clearRun(intervalId);
+                player.onScreenDisplay.setActionBar(MSG.cancel);
+                system.runTimeout(() => {
+                    if (player.isValid) player.onScreenDisplay.setActionBar("");
+                }, 40);
+                player.sendMessage("传送被打断");
+                reject(new Error("interrupted"));
+                return;
+            }
+            prevLoc = { x: player.location.x, z: player.location.z };
+
             const pct = Math.floor(++tick / totalTicks * 100);
-            player.onScreenDisplay.setActionBar(`§a传送加载中... ${pct}%`);
+            player.onScreenDisplay.setActionBar(`${MSG.loading} ${pct}%§a←`);
+
             if (tick >= totalTicks) {
-                system.clearRun(interval);
+                system.clearRun(intervalId);
                 executeTeleportSequence(player, targetLocation, targetDimension, resolve);
             }
         });
     });
 }
 
-// 摄像机动画
+// ---------- 三段式摄像机动画 ----------
 function executeTeleportSequence(player, loc, dim, done) {
-    // 1. 上升
-    player.runCommand(`camera @s set minecraft:free ease ${CAM.rise} out_expo pos ~ ~50 ~ facing ~ ~-1 ~`);
-    player.onScreenDisplay.setActionBar(`√传送系统执行√`);
+    if (!player.isValid) { done(); return; }
+
+    const { rise, move, fall } = CAM;
+
+    const safeCommand = (cmd) => {
+        try {
+            player.runCommand(cmd);
+        } catch (e) {
+            console.warn("命令执行失败:", cmd, e);
+        }
+    };
+
+    // 上升
+    safeCommand(`camera @s set minecraft:free ease ${rise} out_expo pos ~ ~50 ~ facing ~ ~-1 ~`);
+    player.onScreenDisplay.setActionBar(MSG.executing);
 
     system.runTimeout(() => {
-        // 2. 传送到目标维度高空
-        player.teleport({ x: loc.x, y: 10000, z: loc.z }, { dimension: dim });
-        player.onScreenDisplay.setActionBar(`√开始移动至坐标点√`);
+        if (!player.isValid) { done(); return; }
 
-        // 3. 移动到目标上方
-        player.runCommand(`camera @s set minecraft:free ease ${CAM.move} in_out_expo pos ${loc.x} ${loc.y + 50} ${loc.z}`);
+        // 传送到高空
+        try {
+            player.teleport({ x: loc.x, y: 10000, z: loc.z }, { dimension: dim });
+        } catch (e) {
+            console.warn("高空传送失败，尝试直接传送目标点", e);
+            try {
+                player.teleport(loc, { dimension: dim });
+            } catch (ignored) {}
+            player.onScreenDisplay.setActionBar("§c传送失败，已回退");
+            done();
+            return;
+        }
+        player.onScreenDisplay.setActionBar(MSG.moving);
+        safeCommand(`camera @s set minecraft:free ease ${move} in_out_expo pos ${loc.x} ${loc.y + 50} ${loc.z}`);
 
         system.runTimeout(() => {
-            // 4. 下降到目标点
-            player.teleport(loc, { dimension: dim });
-            player.runCommand(`camera @s set minecraft:free ease ${CAM.fall} in_cubic pos ~ ~1.6 ~ facing ^ ^1.5 ^10`);
-            player.onScreenDisplay.setActionBar(`√开始降落√`);
+            if (!player.isValid) { done(); return; }
+
+            // 下降
+            try {
+                player.teleport(loc, { dimension: dim });
+            } catch (e) {
+                console.warn("目标点传送失败", e);
+                player.onScreenDisplay.setActionBar("§c传送失败");
+                done();
+                return;
+            }
+            safeCommand(`camera @s set minecraft:free ease ${fall} in_cubic pos ~ ~1.6 ~ facing ^ ^1.5 ^10`);
+            player.onScreenDisplay.setActionBar(MSG.falling);
 
             system.runTimeout(() => {
-                player.runCommand(`camera @s clear`);
-                player.onScreenDisplay.setActionBar(`§a√§f动画传送完成§a√`);//脑补
+                if (player.isValid) {
+                    safeCommand("camera @s clear");
+                    player.onScreenDisplay.setActionBar(MSG.done);
+                }
                 done();
-            }, CAM.fall * 20);
-        }, CAM.move * 20);
-    }, CAM.rise * 20);
+            }, fall * 20);
+        }, move * 20);
+    }, rise * 20);
 }
 
-// 接口 1.20+
-/*export function enhancedTeleport(player, x, y, z, dimensionId) {
-    performTeleportAnimation(player, { x, y, z }, get_di_by_id(dimensionId));
+// ---------- 向后兼容的旧接口（保留） ----------
+export function enhancedTeleport(player, x, y, z, dimensionId) {
+    tpWithAnimation(player, { x, y, z }, getDimensionById(dimensionId));
 }
 
 export function enhancedEntityTeleport(source, target) {
-    performTeleportAnimation(source, target.location, target.dimension);
-}*/
+    tpWithAnimation(source, target.location, target.dimension);
+}
 
-//灵感来自于hyy,传送动画
-//小洋骢
+//小洋葱出品
+//打断版
